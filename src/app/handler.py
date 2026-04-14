@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from http import HTTPStatus
 from typing import Any
 
@@ -18,9 +19,18 @@ from app.utils.urls import InvalidUrlError
 LOGGER = logging.getLogger(__name__)
 SETTINGS = Settings.from_env()
 configure_logging(SETTINGS.log_level)
+INIT_AT_MONOTONIC = time.perf_counter()
+_IS_COLD_START = True
 
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    global _IS_COLD_START
+
+    handler_start = time.perf_counter()
+    request_id = getattr(context, "aws_request_id", None)
+    cold_start = _IS_COLD_START
+    _IS_COLD_START = False
+
     service = MainService(
         settings=SETTINGS,
         storage=DynamoStorage(
@@ -35,10 +45,32 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     )
 
     try:
-        request = UrlCategorizationRequest.model_validate(_extract_body(event))
+        extract_body_start = time.perf_counter()
+        body = _extract_body(event)
+        extract_body_ms = _elapsed_ms(extract_body_start)
+
+        validation_start = time.perf_counter()
+        request = UrlCategorizationRequest.model_validate(body)
+        validation_ms = _elapsed_ms(validation_start)
+
+        service_start = time.perf_counter()
         response = service.process_url(str(request.url))
+        service_ms = _elapsed_ms(service_start)
     except (ValidationError, InvalidUrlError) as exc:
         LOGGER.info("invalid_request", extra={"error": str(exc)})
+        LOGGER.info(
+            "handler_timing",
+            extra={
+                "aws_request_id": request_id,
+                "cold_start": cold_start,
+                "time_since_init_ms": int((time.perf_counter() - INIT_AT_MONOTONIC) * 1000),
+                "extract_body_ms": locals().get("extract_body_ms", 0),
+                "validation_ms": locals().get("validation_ms", 0),
+                "service_ms": 0,
+                "total_handler_ms": _elapsed_ms(handler_start),
+                "result": "invalid_request",
+            },
+        )
         return _json_response(
             HTTPStatus.BAD_REQUEST,
             {
@@ -48,6 +80,19 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         )
     except Exception:
         LOGGER.exception("request_failed")
+        LOGGER.info(
+            "handler_timing",
+            extra={
+                "aws_request_id": request_id,
+                "cold_start": cold_start,
+                "time_since_init_ms": int((time.perf_counter() - INIT_AT_MONOTONIC) * 1000),
+                "extract_body_ms": locals().get("extract_body_ms", 0),
+                "validation_ms": locals().get("validation_ms", 0),
+                "service_ms": locals().get("service_ms", 0),
+                "total_handler_ms": _elapsed_ms(handler_start),
+                "result": "request_failed",
+            },
+        )
         return _json_response(
             HTTPStatus.INTERNAL_SERVER_ERROR,
             {"message": "Internal server error"},
@@ -57,6 +102,19 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     if response.status == "pending":
         status_code = HTTPStatus.ACCEPTED
 
+    LOGGER.info(
+        "handler_timing",
+        extra={
+            "aws_request_id": request_id,
+            "cold_start": cold_start,
+            "time_since_init_ms": int((time.perf_counter() - INIT_AT_MONOTONIC) * 1000),
+            "extract_body_ms": extract_body_ms,
+            "validation_ms": validation_ms,
+            "service_ms": service_ms,
+            "total_handler_ms": _elapsed_ms(handler_start),
+            "result": response.status,
+        },
+    )
     return _json_response(status_code, response.model_dump(exclude_none=True))
 
 
@@ -79,3 +137,7 @@ def _json_response(status_code: int, body: dict[str, Any]) -> dict[str, Any]:
         "headers": {"content-type": "application/json"},
         "body": json.dumps(body),
     }
+
+
+def _elapsed_ms(start: float) -> int:
+    return int((time.perf_counter() - start) * 1000)
